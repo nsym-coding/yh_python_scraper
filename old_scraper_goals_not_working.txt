@@ -1,0 +1,332 @@
+import sys
+import json
+import re
+import time
+from datetime import datetime
+from bs4 import BeautifulSoup
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+def parse_date(date_string):
+    """Parse date string like 'Sat 18 October 2025' to YYYY-MM-DD format"""
+    try:
+        # Extract just the date part (remove day of week)
+        date_part = ' '.join(date_string.split()[1:])
+        date_obj = datetime.strptime(date_part, '%d %B %Y')
+        return date_obj.strftime('%Y-%m-%d')
+    except Exception as e:
+        print(f"Error parsing date: {e}")
+        return None
+
+def clean_team_name(team_name):
+    """Remove U18S/U21S suffixes and format team name"""
+    # Remove U18S, U21S, etc. (case insensitive)
+    cleaned = re.sub(r'\s*U\d+S?$', '', team_name, flags=re.IGNORECASE)
+    # Convert to title case (first letter of each word capitalized)
+    return cleaned.strip().title()
+
+def parse_player_name(full_name):
+    """Split player name into first_name and last_name"""
+    parts = full_name.strip().split()
+    if len(parts) == 0:
+        return "", ""
+    elif len(parts) == 1:
+        return parts[0].lower(), ""
+    else:
+        first_name = parts[0].lower()
+        last_name = ' '.join(parts[1:]).lower()
+        return first_name, last_name
+
+def fetch_with_retry(url, max_retries=3):
+    """Fetch URL with exponential backoff retry logic"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Connection': 'keep-alive',
+    }
+    
+    backoff = 1  # Start with 1 second
+    last_error = None
+    
+    for attempt in range(max_retries + 1):
+        try:
+            print(f"Attempt {attempt + 1}/{max_retries + 1}...")
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            
+            # Verify we got HTML content
+            if response.text and len(response.text) > 100:
+                return response
+            else:
+                last_error = Exception("Received empty or invalid response")
+                
+        except requests.RequestException as e:
+            last_error = e
+            print(f"Request failed: {e}")
+        
+        # If not the last attempt, wait before retrying
+        if attempt < max_retries:
+            print(f"Retrying in {backoff} seconds...")
+            time.sleep(backoff)
+            backoff *= 2  # Exponential backoff
+        
+    # All retries exhausted
+    if last_error:
+        raise Exception(f"Failed to fetch page after {max_retries + 1} attempts: {last_error}")
+    else:
+        raise Exception(f"Failed to fetch page after {max_retries + 1} attempts (unknown error)")
+
+def scrape_match(url):
+    """Scrape match data from YouthHawk page"""
+    
+    # Fetch the page with retry logic
+    response = fetch_with_retry(url)
+    soup = BeautifulSoup(response.content, 'html.parser')
+    
+    # Extract date from the first table
+    # Try multiple methods to find the date
+    date_text = None
+    
+    # Method 1: Look for date in a table cell
+    date_cell = soup.find('td', string=re.compile(r'(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d+\s+\w+\s+\d{4}'))
+    if date_cell:
+        date_text = date_cell.get_text(strip=True)
+    
+    # Method 2: Search entire page text for date pattern
+    if not date_text:
+        page_text = soup.get_text()
+        date_match = re.search(r'(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d+\s+\w+\s+\d{4})', page_text)
+        if date_match:
+            date_text = date_match.group(0)
+    
+    if not date_text:
+        print("Could not find date in page")
+        print("Page content sample:", soup.get_text()[:500])
+        return None
+    
+    match_date = parse_date(date_text)
+    print(f"Match date: {match_date}")
+    
+    # Extract team names and score from the header table
+    team_headers = soup.find_all('th', valign='top')
+    if len(team_headers) < 3:
+        print("Could not find team headers")
+        return None
+    
+    home_team_link = team_headers[0].find('a')
+    away_team_link = team_headers[2].find('a')
+    score_cell = team_headers[1]
+    
+    if not home_team_link or not away_team_link:
+        print("Could not find team links")
+        return None
+    
+    home_team = clean_team_name(home_team_link.get_text(strip=True))
+    away_team = clean_team_name(away_team_link.get_text(strip=True))
+    
+    # Parse score
+    score_text = score_cell.get_text(strip=True)
+    score_match = re.search(r'(\d+).*?(\d+)', score_text)
+    if not score_match:
+        print("Could not parse score")
+        return None
+    
+    home_score = int(score_match.group(1))
+    away_score = int(score_match.group(2))
+    
+    print(f"Teams: {home_team} {home_score}-{away_score} {away_team}")
+    
+    # Determine win/draw/clean_sheet values for each team
+    home_win = 2 if home_score > away_score else 0
+    away_win = 2 if away_score > home_score else 0
+    home_draw = 1 if home_score == away_score else 0
+    away_draw = 1 if home_score == away_score else 0
+    home_clean_sheet = 1 if away_score == 0 else 0
+    away_clean_sheet = 1 if home_score == 0 else 0
+    
+    # Extract goal scorers from the score section
+    goal_scorers = {}  # {last_name: goal_count}
+    
+    # Find the row with goal scorers (style font-size:85%)
+    goal_row = soup.find('tr', style='font-size:85%')
+    if goal_row:
+        goal_cells = goal_row.find_all('td')
+        
+        # Home team goals (first cell)
+        if len(goal_cells) > 0:
+            home_goal_links = goal_cells[0].find_all('a')
+            for link in home_goal_links:
+                player_name = link.get_text(strip=True)
+                _, last_name = parse_player_name(player_name)
+                # Count goal markers after the player name
+                next_text = link.next_sibling
+                if next_text:
+                    goal_minutes = re.findall(r"'(\d+)", str(next_text))
+                    if last_name and goal_minutes:
+                        goal_scorers[last_name] = len(goal_minutes)
+        
+        # Away team goals (third cell)
+        if len(goal_cells) > 2:
+            # Get all text from the cell and split by <br>
+            away_cell = goal_cells[2]
+            # Process each line (player)
+            for br in away_cell.find_all('br'):
+                br.replace_with('\n')
+            
+            lines = away_cell.get_text().split('\n')
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                # Find player link
+                player_links = away_cell.find_all('a')
+                for link in player_links:
+                    player_name = link.get_text(strip=True)
+                    _, last_name = parse_player_name(player_name)
+                    # Count goal markers after the player name
+                    next_text = link.next_sibling
+                    if next_text:
+                        goal_minutes = re.findall(r"'(\d+)", str(next_text))
+                        if last_name and goal_minutes:
+                            goal_scorers[last_name] = len(goal_minutes)
+    
+    print(f"Goal scorers: {goal_scorers}")
+    
+    # Parse lineups from both team tables
+    team_tables = soup.find_all('table', style='font-size: 90%')
+    
+    if len(team_tables) < 2:
+        print("Could not find team lineup tables")
+        return None
+    
+    players_data = {home_team: [], away_team: []}
+    
+    # Process each team's table
+    for idx, table in enumerate(team_tables[:2]):
+        current_team = home_team if idx == 0 else away_team
+        
+        if current_team == home_team:
+            win = home_win
+            draw = home_draw
+            clean_sheet = home_clean_sheet
+        else:
+            win = away_win
+            draw = away_draw
+            clean_sheet = away_clean_sheet
+        
+        # Find all player rows
+        rows = table.find_all('tr')
+        
+        for row in rows:
+            cells = row.find_all('td')
+            if len(cells) < 3:
+                continue
+            
+            # Check if this is a player row (has position or number)
+            player_link = cells[2].find('a')
+            if not player_link:
+                continue
+            
+            player_name = player_link.get_text(strip=True)
+            first_name, last_name = parse_player_name(player_name)
+            
+            if not last_name:
+                continue
+            
+            # Check for substitution markers in the same row
+            minutes_played = 90
+            is_starter = 1
+            is_sub = 0
+            
+            # Look for Suboff image (substituted off)
+            suboff_img = row.find('img', src=re.compile(r'Suboff'))
+            if suboff_img:
+                # Find the minute in the same cell
+                parent_cell = suboff_img.find_parent('td')
+                if parent_cell:
+                    minute_text = parent_cell.get_text()
+                    minute_match = re.search(r"'(\d+)", minute_text)
+                    if minute_match:
+                        minutes_played = int(minute_match.group(1))
+            
+            # Look for Subon image (substituted on)
+            subon_img = row.find('img', src=re.compile(r'Subon'))
+            if subon_img:
+                is_starter = 0
+                parent_cell = subon_img.find_parent('td')
+                if parent_cell:
+                    minute_text = parent_cell.get_text()
+                    minute_match = re.search(r"'(\d+)", minute_text)
+                    if minute_match:
+                        sub_minute = int(minute_match.group(1))
+                        minutes_played = 90 - sub_minute
+                        is_sub = 1 if minutes_played >= 15 else 0
+            
+            # Calculate goals
+            goals = 0
+            if last_name in goal_scorers:
+                goals = goal_scorers[last_name] * 2
+            
+            # Apply win/draw/clean_sheet only to starters and subs who played 15+ mins
+            player_win = win if (is_starter == 1 or is_sub == 1) else 0
+            player_draw = draw if (is_starter == 1 or is_sub == 1) else 0
+            player_clean_sheet = clean_sheet if (is_starter == 1 or is_sub == 1) else 0
+            
+            player_data = {
+                "first_name": first_name,
+                "last_name": last_name,
+                "start": is_starter,
+                "minutes_played": minutes_played,
+                "sub": is_sub,
+                "win": player_win,
+                "draw": player_draw,
+                "clean_sheet": player_clean_sheet,
+                "goals": goals,
+                "assists": 0,
+                "team_name": current_team,
+                "date": match_date
+            }
+            
+            # Check if player already exists (avoid duplicates)
+            player_exists = False
+            for existing_player in players_data[current_team]:
+                if (existing_player['first_name'] == first_name and 
+                    existing_player['last_name'] == last_name):
+                    player_exists = True
+                    break
+            
+            if not player_exists:
+                players_data[current_team].append(player_data)
+    
+    # Write JSON files
+    for team_name, players in players_data.items():
+        if players:
+            filename = f"{match_date}_{team_name.replace(' ', '_')}.json"
+            with open(filename, 'w') as f:
+                json.dump(players, f, indent=2)
+            print(f"Created {filename} with {len(players)} players")
+    
+    return players_data
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python scraper.py <url>")
+        sys.exit(1)
+    
+    url = sys.argv[1]
+    print(f"Scraping: {url}")
+    
+    try:
+        result = scrape_match(url)
+        if result:
+            print("\nScraping completed successfully!")
+        else:
+            print("\nScraping failed!")
+            sys.exit(1)
+    except Exception as e:
+        print(f"Error scraping match: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
