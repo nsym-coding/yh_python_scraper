@@ -23,7 +23,7 @@ def main():
     for i, url in enumerate(urls, 1):
         print(f"\n[{i}/{len(urls)}] Running scraper for: {url}")
         try:
-            subprocess.run(["python3", "scraper.py", url], check=True)
+            subprocess.run(["python3", "combined_scraper.py", url], check=True)
         except subprocess.CalledProcessError as e:
             print(f"Error while processing {url}: {e}")
         if i < len(urls):
